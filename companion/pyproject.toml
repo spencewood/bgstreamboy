@@ -1,0 +1,23 @@
+[project]
+name = "bgstreamboy"
+version = "0.1.0"
+description = "Tail Hearthstone Power.log and broadcast Battlegrounds state over a local WebSocket"
+readme = "README.md"
+authors = [
+    { name = "Tyler Spencewood", email = "tspencewood@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "hslog>=1.0",
+    "hearthstone>=1.4",
+    "watchfiles>=1.0",
+    "websockets>=14.0",
+    "pydantic>=2.10",
+]
+
+[project.scripts]
+bgstreamboy = "bgstreamboy.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.11.9,<0.12.0"]
+build-backend = "uv_build"

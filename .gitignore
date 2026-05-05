@@ -1,0 +1,35 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+.venv/
+.uv-cache/
+*.egg-info/
+build/
+dist/
+
+# --- Node ---
+node_modules/
+npm-debug.log*
+
+# --- Stream Deck plugin build output ---
+plugin/com.bgstreamboy.companion.sdPlugin/bin/
+
+# --- Editor / OS ---
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# --- Local user settings / secrets ---
+.env
+.env.local
+
+# --- Hearthstone Power.log captures ---
+# Keep the small synthetic fixture used by smoke_service; ignore everything
+# else so we never accidentally commit a real game capture.
+*.log
+*.power.log
+!companion/tests/fixtures/spike_minimal.power.log

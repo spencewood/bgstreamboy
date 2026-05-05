@@ -1,0 +1,45 @@
+{
+  "Name": "BG Stream Boy",
+  "Version": "0.1.0.0",
+  "Author": "Tyler Spencewood",
+  "Actions": [
+    {
+      "Name": "BG Slot",
+      "UUID": "com.bgstreamboy.companion.slot",
+      "Icon": "imgs/actions/slot/icon",
+      "Tooltip": "One cell of the BG Stream Boy grid; renders whatever the companion service tells it to.",
+      "Controllers": ["Keypad"],
+      "UserTitleEnabled": false,
+      "States": [
+        {
+          "Image": "imgs/actions/slot/key",
+          "TitleAlignment": "middle"
+        }
+      ]
+    }
+  ],
+  "Category": "BG Stream Boy",
+  "CategoryIcon": "imgs/plugin/category-icon",
+  "CodePath": "bin/plugin.js",
+  "Description": "Live Hearthstone Battlegrounds buff display for Stream Deck. Pair with the bgstreamboy companion service.",
+  "Icon": "imgs/plugin/marketplace",
+  "SDKVersion": 3,
+  "Software": {
+    "MinimumVersion": "6.9"
+  },
+  "OS": [
+    {
+      "Platform": "mac",
+      "MinimumVersion": "12"
+    },
+    {
+      "Platform": "windows",
+      "MinimumVersion": "10"
+    }
+  ],
+  "Nodejs": {
+    "Version": "20",
+    "Debug": "enabled"
+  },
+  "UUID": "com.bgstreamboy.companion"
+}

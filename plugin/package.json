@@ -1,0 +1,27 @@
+{
+  "name": "bgstreamboy-plugin",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "rolldown -c rolldown.config.ts",
+    "watch": "rolldown -c rolldown.config.ts -w",
+    "postinstall": "npm --prefix com.bgstreamboy.companion.sdPlugin install",
+    "link": "streamdeck link com.bgstreamboy.companion.sdPlugin",
+    "unlink": "streamdeck unlink com.bgstreamboy.companion",
+    "restart": "streamdeck restart com.bgstreamboy.companion",
+    "validate": "streamdeck validate com.bgstreamboy.companion.sdPlugin"
+  },
+  "dependencies": {
+    "@elgato/streamdeck": "^2.0.0",
+    "@napi-rs/canvas": "^0.1.61",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@elgato/cli": "^1.7.4",
+    "@tsconfig/node20": "^20.1.4",
+    "@types/node": "^20.19.0",
+    "@types/ws": "^8.5.13",
+    "rolldown": "^1.0.0-rc.6",
+    "typescript": "^5.6.0"
+  }
+}
