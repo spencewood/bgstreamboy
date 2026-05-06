@@ -33,9 +33,19 @@ class Side(BaseModel):
     buffs: list[Buff] = Field(default_factory=list)
 
 
+ServiceStatus = Literal[
+    "ok",
+    "rotated",
+    "rotation_stalled",
+    "hearthstone_capped",
+    "rotation_failed",
+]
+
+
 class Snapshot(BaseModel):
     mode: Mode = "unknown"
     phase: Phase = "unknown"
     player: Side = Field(default_factory=Side)
     ally: Side | None = None
     tribes: list[Tribe] = Field(default_factory=list)
+    service_status: ServiceStatus = "ok"

@@ -41,7 +41,9 @@ async def main() -> int:
         log_path.touch()
 
         service_task = asyncio.create_task(
-            service.run(logs_dir, host=DEFAULT_HOST, port=PORT)
+            # Explicit source="file" — this test covers the file-tailing path.
+            # Console streaming is exercised by run_log_stream_test instead.
+            service.run(logs_dir, host=DEFAULT_HOST, port=PORT, source="file")
         )
 
         if not await _wait_for_service(service_task):

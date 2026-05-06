@@ -29,6 +29,16 @@ def main() -> None:
     parser.add_argument("--host", default=DEFAULT_HOST)
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument(
+        "--source",
+        choices=["auto", "console", "file"],
+        default="auto",
+        help="Where to read game events from. 'auto' picks console on macOS "
+        "(uncapped) and file elsewhere. 'console' is macOS-only and requires "
+        "log.config ConsolePrinting=true. 'file' tails Power.log on any "
+        "platform (subject to Hearthstone's 10 MB session cap; rotation "
+        "mitigates).",
+    )
+    parser.add_argument(
         "--install-log-config",
         action="store_true",
         help="Write Hearthstone's log.config and exit. Restart Hearthstone afterward.",
@@ -90,6 +100,6 @@ def main() -> None:
         print(f"Latest existing session log: {latest}", file=sys.stderr)
 
     try:
-        asyncio.run(service.run(args.logs_dir, host=args.host, port=args.port))
+        asyncio.run(service.run(args.logs_dir, host=args.host, port=args.port, source=args.source))
     except KeyboardInterrupt:
         pass

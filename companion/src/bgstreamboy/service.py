@@ -9,6 +9,7 @@ from pathlib import Path
 from hslog.packets import Packet
 
 from .buff_extractor import BuffExtractor
+from .log_stream import follow_console_async
 from .log_tailer import follow_async, replay_paced_async
 from .perspective import Perspective
 from .phase_detector import PhaseDetector
@@ -76,12 +77,38 @@ class Service:
         return {"player": Side(buffs=player_buffs), "ally": ally_side}
 
 
-async def run(logs_dir: Path, host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
+async def run(
+    logs_dir: Path,
+    host: str = DEFAULT_HOST,
+    port: int = DEFAULT_PORT,
+    source: str = "auto",
+) -> None:
+    """Live-tailing service.
+
+    `source`:
+      - "auto":    pick the best available for this platform — console on
+                   macOS (uncapped), file elsewhere (with rotation).
+      - "console": stream from macOS unified log via `log stream`. Bypasses
+                   Hearthstone's 10 MB Power.log cap entirely. Mac only.
+      - "file":    tail the on-disk Power.log (cross-platform). Subject to
+                   the 10 MB cap; our LogRotator pre-empts it.
+    """
+    from .platform_paths import default_source as _default_source
+
+    if source == "auto":
+        source = _default_source()
+
     broadcaster = SnapshotBroadcaster()
     service = Service(broadcaster)
+    if source == "console":
+        feeder = follow_console_async(service.on_packet)
+    elif source == "file":
+        feeder = follow_async(logs_dir, service.on_packet)
+    else:
+        raise ValueError(f"unknown source: {source!r}")
     await asyncio.gather(
         serve_forever(broadcaster, host=host, port=port),
-        follow_async(logs_dir, service.on_packet),
+        feeder,
     )
 
 

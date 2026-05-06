@@ -23,6 +23,8 @@ from hslog.packets import (
 )
 from watchfiles import awatch
 
+from .log_rotator import LogRotator, TRUNCATION_MARKER
+
 # Packet types whose `tags` list is populated on lines AFTER the packet is
 # registered. We deliver these to the callback only when the *next* packet
 # arrives (or on flush) so the tags are observable.
@@ -34,7 +36,9 @@ _DEFERRED_PACKET_TYPES = (CreateGame, FullEntity, ShowEntity, ChangeEntity)
 # user callback and keep the pending CreateGame alive across them.
 _NESTED_IN_CREATE_GAME = (CreateGame.Player,)
 
-DEFAULT_LOGS_DIR = Path("/Applications/Hearthstone/Logs")
+from .platform_paths import discover_logs_dir
+
+DEFAULT_LOGS_DIR: Path = discover_logs_dir()
 
 PacketCallback = Callable[[Packet], None]
 
@@ -93,13 +97,15 @@ def _hook_register_packet(parser: LogParser, on_packet: PacketCallback) -> tuple
     return parser, flush
 
 
-def _drain_complete_lines(f, parser: LogParser) -> None:
+def _drain_complete_lines(f, parser: LogParser, rotator: LogRotator | None = None) -> None:
     while True:
         pos = f.tell()
         line = f.readline()
         if not line.endswith("\n"):
             f.seek(pos)
             return
+        if rotator is not None and TRUNCATION_MARKER in line:
+            rotator.observe_line(line)
         try:
             parser.read_line(line)
         except Exception as e:
@@ -138,10 +144,16 @@ async def _consume_session(log_path: Path, parser: LogParser, logs_dir: Path) ->
 
     Reads from the beginning of the file so we don't miss CREATE_GAME (which
     typically lands moments before we attach to a freshly-created session log).
+
+    Also runs a `LogRotator` that proactively rolls the file when it
+    approaches Hearthstone's 10 MB cap. Hearthstone closes the log handle
+    permanently once it hits the cap, so without rotation a long session
+    goes silent.
     """
+    rotator = LogRotator(log_path)
     with log_path.open("r", encoding="utf-8", errors="replace") as f:
         f.seek(0)
-        _drain_complete_lines(f, parser)
+        _drain_complete_lines(f, parser, rotator)
         last_size = log_path.stat().st_size
         async for _ in awatch(str(logs_dir), recursive=True, debounce=200):
             latest = find_latest_session_log(logs_dir)
@@ -153,9 +165,14 @@ async def _consume_session(log_path: Path, parser: LogParser, logs_dir: Path) ->
             except FileNotFoundError:
                 return
             if current_size < last_size:
-                return  # truncation
-            _drain_complete_lines(f, parser)
+                return  # truncation (either ours via rotation or Hearthstone's)
+            _drain_complete_lines(f, parser, rotator)
             last_size = log_path.stat().st_size
+            # Pre-empt Hearthstone's 10 MB cap. If we rotate, the file shrinks
+            # and the next loop iteration's truncation check returns us to
+            # follow_async, which will reattach to the same path.
+            if rotator.maybe_rotate():
+                return
 
 
 def follow_file(log_path: Path, on_packet: PacketCallback) -> None:
