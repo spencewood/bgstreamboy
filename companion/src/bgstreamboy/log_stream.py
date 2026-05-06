@@ -1,147 +1,175 @@
-"""Stream Hearthstone Power events from macOS unified log.
+"""Tail Hearthstone's consolidated `Hearthstone.log`.
 
 When ``log.config`` has ``ConsolePrinting=true`` for the Power channel,
-Hearthstone duplicates every Power.log event to stdout. macOS captures
-GUI-app stdout into its unified log (`log stream` / Console.app), which has
-no per-session file-size cap — unlike Power.log's 10 MB ceiling.
+Hearthstone duplicates events into a second file alongside ``Power.log``:
 
-This module spawns ``log stream`` as a subprocess filtered to Hearthstone's
-PID, peels off macOS's metadata wrappers, and forwards just the original
-``D HH:MM:SS.fffffff GameState.DebugPrintPower()`` lines to the same
-``hslog`` parser the file-tailer uses.
+    /Applications/Hearthstone/Logs/Hearthstone_<ts>/Hearthstone.log
 
-Tradeoffs vs file tailing:
+Each session writes to its own copy. Format differs slightly from
+``Power.log``:
 
-  + No cap. Long sessions stay live.
-  + No file-rotation choreography needed.
-  + Captures events even after Hearthstone hits its file cap and stops
-    writing the file.
-  - Requires `ConsolePrinting=true` in log.config (one-time install change).
-  - Requires Hearthstone be running so we can locate its PID.
-  - macOS-specific (Linux/Windows would need different plumbing).
+    Power.log     : ``D 19:13:45.864 GameState.DebugPrintPower() - CREATE_GAME``
+    Hearthstone.log: ``I 21:04:30.268 [Power] GameState.DebugPrintPower() - CREATE_GAME``
+
+We strip the ``[Power]`` channel tag and feed the line straight into hslog,
+which accepts ``I``/``D``/``E``/``W``/``V`` as level prefixes. We filter to
+just the Power and LoadingScreen channels — other channels (Net, Decks,
+etc.) carry no data we care about.
+
+Why bother with this when Power.log has the same content?
+
+  - Power.log is hard-capped at 10 MB per session. Once Hearthstone hits
+    the cap, it stops writing — period — until app restart. Hearthstone.log
+    is a different file that *may* roll separately or have a higher cap.
+    Whichever way it caps, our `LogRotator` also covers it.
+  - When ConsolePrinting is on, Hearthstone.log is the broader source of
+    truth — it captures the same events as Power.log plus other channels
+    we may want later.
 """
 
 from __future__ import annotations
 
-import asyncio
 import re
-import shutil
-import subprocess
 import sys
 from collections.abc import Callable
 from pathlib import Path
 
 from hslog import LogParser
 from hslog.packets import Packet
+from watchfiles import awatch
 
-from .log_tailer import _hook_register_packet
+from .log_rotator import LogRotator
+from .log_tailer import (
+    _drain_complete_lines,
+    _hook_register_packet,
+    find_latest_session_log,
+)
+from .platform_paths import discover_logs_dir
 
 PacketCallback = Callable[[Packet], None]
 
+# Only the Power channel is parseable by hslog. Other channels (LoadingScreen,
+# Net, Decks…) use different formats hslog doesn't understand. We filter
+# everything else out before forwarding.
+ACCEPTED_CHANNELS = ("Power",)
 
-# Match `D HH:MM:SS.fffffff <prefix>.<method>() ...` anywhere on a line.
-# macOS unified log prefixes its own timestamp/source columns; we tolerate
-# anything before the Hearthstone-format timestamp.
-_HS_LINE_RE = re.compile(
-    r"(D \d{2}:\d{2}:\d{2}\.\d+ \S+\.[A-Za-z]+\(\) .+)$"
+# Capture: level, timestamp, channel, body.
+_CHANNEL_LINE_RE = re.compile(
+    r"^([DEWVI])\s+(\d{2}:\d{2}:\d{2}\.\d+)\s+\[(\w+)\]\s+(.+)$"
 )
 
 
-def hearthstone_pids() -> list[int]:
-    """Return PIDs of any running Hearthstone process(es)."""
-    try:
-        out = subprocess.run(
-            ["pgrep", "-x", "Hearthstone"],
-            capture_output=True, text=True, check=False,
-        )
-        return [int(p) for p in out.stdout.split() if p.strip()]
-    except FileNotFoundError:
-        return []
+def transform_console_line(line: str) -> str | None:
+    """Convert a Hearthstone.log line into something hslog can parse, or
+    None if the line isn't a tracked-channel event.
 
-
-def _have_log_command() -> bool:
-    return shutil.which("log") is not None
-
-
-async def follow_console_async(on_packet: PacketCallback) -> None:
-    """Block forever, parsing Hearthstone Power events from `log stream`.
-
-    Auto-discovers Hearthstone's PID at start; if Hearthstone isn't running
-    yet, waits for it to launch. If `log stream` exits (e.g. Hearthstone
-    quits), reconnects when Hearthstone reappears.
+    Hearthstone.log uses an `I` (Info) level prefix; hslog's `TIMESTAMP_RE`
+    only accepts `[DWE]`, so we always rewrite the level to `D` regardless
+    of what the source had — these are all the same Power-channel events
+    that Power.log writes with `D`.
     """
-    if not _have_log_command():
-        raise RuntimeError(
-            "`log` CLI not found — console streaming requires macOS. "
-            "Falling back to file tailing is recommended on other platforms."
-        )
-
-    while True:
-        pids = hearthstone_pids()
-        if not pids:
-            print("[bgstreamboy] waiting for Hearthstone to launch…", file=sys.stderr)
-            while not hearthstone_pids():
-                await asyncio.sleep(2.0)
-            pids = hearthstone_pids()
-
-        pid = pids[0]
-        print(f"[bgstreamboy] streaming Hearthstone console (pid={pid})", file=sys.stderr)
-        await _stream_one(pid, on_packet)
-        # `log stream` exited — Hearthstone probably quit. Loop reattaches.
-        print("[bgstreamboy] log stream ended; will reattach when Hearthstone returns", file=sys.stderr)
-
-
-async def _stream_one(pid: int, on_packet: PacketCallback) -> None:
-    parser = LogParser()
-    _, flush = _hook_register_packet(parser, on_packet)
-
-    # `--style ndjson` would give structured output but the message body
-    # would still be the raw log line. `--style compact` is simpler — we
-    # just regex the `D HH:MM:SS` Hearthstone format off the end.
-    cmd = [
-        "log", "stream",
-        "--style", "compact",
-        "--predicate", f"processIdentifier == {pid}",
-    ]
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.DEVNULL,
-    )
-
-    try:
-        assert proc.stdout is not None
-        async for raw in proc.stdout:
-            line = raw.decode("utf-8", errors="replace")
-            extracted = _extract_hs_line(line)
-            if extracted is None:
-                continue
-            try:
-                parser.read_line(extracted)
-            except Exception as e:
-                print(f"[hslog parse error] {e!r}: {extracted.rstrip()!r}", file=sys.stderr)
-    finally:
-        try:
-            proc.terminate()
-        except ProcessLookupError:
-            pass
-        await proc.wait()
-        flush()
-
-
-def _extract_hs_line(line: str) -> str | None:
-    """Pick the `D HH:MM:SS.fff <prefix>.<method>() …` payload out of a
-    `log stream --style compact` line.
-
-    macOS prepends its own timestamp + sender columns; we don't care about
-    those. Returns None for any line that doesn't look like a Hearthstone
-    Power event (e.g. unrelated Hearthstone log noise, OS chatter)."""
     if not line:
         return None
-    m = _HS_LINE_RE.search(line)
+    rstripped = line.rstrip("\n")
+    m = _CHANNEL_LINE_RE.match(rstripped)
     if m is None:
         return None
-    payload = m.group(1)
-    if not payload.endswith("\n"):
-        payload += "\n"
-    return payload
+    _level, ts, channel, body = m.groups()
+    if channel not in ACCEPTED_CHANNELS:
+        return None
+    return f"D {ts} {body}\n"
+
+
+def find_latest_hearthstone_log(logs_dir: Path) -> Path | None:
+    """Return the most recent session's Hearthstone.log, or None.
+
+    Mirrors `find_latest_session_log` but for the consolidated log file.
+    """
+    if not logs_dir.exists():
+        return None
+    candidates: list[tuple[float, Path]] = []
+    for d in logs_dir.iterdir():
+        if d.is_dir() and d.name.startswith("Hearthstone_"):
+            log = d / "Hearthstone.log"
+            if log.exists():
+                candidates.append((d.stat().st_mtime, log))
+    if not candidates:
+        return None
+    candidates.sort()
+    return candidates[-1][1]
+
+
+async def follow_console_async(
+    on_packet: PacketCallback,
+    logs_dir: Path | None = None,
+) -> None:
+    """Block forever, parsing the latest Hearthstone.log as it grows.
+
+    Auto-discovers the latest session and switches when a new session
+    directory appears. Rotates if the file approaches the 10 MB cap.
+    """
+    if logs_dir is None:
+        logs_dir = discover_logs_dir()
+
+    while True:
+        target = find_latest_hearthstone_log(logs_dir)
+        if target is None:
+            print(f"[bgstreamboy] no Hearthstone.log under {logs_dir}; waiting…", file=sys.stderr)
+            logs_dir.mkdir(parents=True, exist_ok=True)
+            async for _ in awatch(str(logs_dir), recursive=True, debounce=200):
+                if find_latest_hearthstone_log(logs_dir) is not None:
+                    break
+            continue
+
+        print(f"[bgstreamboy] tailing {target}", file=sys.stderr)
+        parser = LogParser()
+        _hook_register_packet(parser, on_packet)
+        try:
+            await _consume_console_session(target, parser, logs_dir)
+        except FileNotFoundError:
+            continue
+
+
+async def _consume_console_session(
+    log_path: Path, parser: LogParser, logs_dir: Path
+) -> None:
+    rotator = LogRotator(log_path)
+    with log_path.open("r", encoding="utf-8", errors="replace") as f:
+        f.seek(0)
+        _drain_console_lines(f, parser, rotator)
+        last_size = log_path.stat().st_size
+        async for _ in awatch(str(logs_dir), recursive=True, debounce=200):
+            latest = find_latest_hearthstone_log(logs_dir)
+            if latest is not None and latest != log_path:
+                print(f"[bgstreamboy] new session detected, switching: {latest}", file=sys.stderr)
+                return
+            try:
+                current_size = log_path.stat().st_size
+            except FileNotFoundError:
+                return
+            if current_size < last_size:
+                return  # truncation
+            _drain_console_lines(f, parser, rotator)
+            last_size = log_path.stat().st_size
+            if rotator.maybe_rotate():
+                return
+
+
+def _drain_console_lines(f, parser: LogParser, rotator: LogRotator) -> None:
+    """Read newline-terminated lines, applying the channel transform before
+    forwarding to hslog. Reuses the rotator's truncation-marker detection
+    against the original (untransformed) lines."""
+    while True:
+        pos = f.tell()
+        line = f.readline()
+        if not line.endswith("\n"):
+            f.seek(pos)
+            return
+        rotator.observe_line(line)
+        transformed = transform_console_line(line)
+        if transformed is None:
+            continue
+        try:
+            parser.read_line(transformed)
+        except Exception as e:
+            print(f"[hslog parse error] {e!r}: {transformed.rstrip()!r}", file=sys.stderr)
