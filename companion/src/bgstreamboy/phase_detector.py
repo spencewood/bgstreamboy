@@ -13,7 +13,7 @@ Empirically verified against tests/fixtures/duos_2026_05_02.power.log.
 from __future__ import annotations
 
 from hearthstone.enums import GameTag
-from hslog.packets import FullEntity, Packet, TagChange
+from hslog.packets import CreateGame, FullEntity, Packet, TagChange
 
 from .snapshot import Phase
 
@@ -34,7 +34,11 @@ class PhaseDetector:
         """Update internal state from a packet. Returns True if phase changed."""
         before = self.phase
 
-        if isinstance(packet, FullEntity):
+        if isinstance(packet, CreateGame):
+            # We're now in a game — assume recruit until a combat tag fires.
+            if self.phase == "unknown":
+                self.phase = "recruit"
+        elif isinstance(packet, FullEntity):
             for tag, val in packet.tags:
                 self._apply(packet.entity, tag, val)
         elif isinstance(packet, TagChange):

@@ -18,7 +18,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from hearthstone.enums import GameTag, Zone
-from hslog.packets import FullEntity, Packet, TagChange
+from hslog.packets import FullEntity, Packet, ShowEntity, TagChange
 
 from .snapshot import Tribe
 
@@ -59,7 +59,7 @@ class TribeTracker:
 
     def observe(self, packet: Packet) -> bool:
         """Update internal state from a packet. Returns True if tribes changed."""
-        if isinstance(packet, FullEntity):
+        if isinstance(packet, (FullEntity, ShowEntity)):
             ent_id = packet.entity if isinstance(packet.entity, int) else getattr(packet.entity, "entity_id", None)
             if ent_id is None:
                 return False
@@ -99,10 +99,16 @@ class TribeTracker:
 
         # Top 5 by high-water mark = lobby tribes.
         lobby = sorted(self._max_pool_seen.items(), key=lambda x: -x[1])[:_NUM_LOBBY_TRIBES]
-        new_cached = [
-            Tribe(name=name, remaining=pool.get(name), max=hw)
-            for name, hw in lobby
-        ]
+        new_cached = []
+        for name, hw in lobby:
+            current = pool.get(name)
+            # When the tracker has briefly lost sight of all entities for a
+            # tribe (they're in someone's hand or on board), fall back to the
+            # high-water mark instead of showing "?". The pool isn't really
+            # zero — we just don't have visibility right now.
+            if current is None or current == 0:
+                current = hw
+            new_cached.append(Tribe(name=name, remaining=current, max=hw))
 
         if [(t.name, t.remaining, t.max) for t in new_cached] == [
             (t.name, t.remaining, t.max) for t in self._cached

@@ -33,10 +33,13 @@ interface PlacedAction {
   row: number;
 }
 
+type BuffSource = "player" | "ally";
+
 class Grid {
   private actions = new Map<string, PlacedAction>();
   private slots = new SlotState();
   private latestSnapshot: Snapshot | null = null;
+  private currentSource: BuffSource = "player";
   private connection: ConnectionState = "disconnected";
   private client: WsClient | null = null;
 
@@ -96,11 +99,26 @@ class Grid {
 
   private handleSnapshot(snapshot: Snapshot): void {
     this.latestSnapshot = snapshot;
-    const source = snapshot.phase === "combat" && snapshot.ally ? snapshot.ally : snapshot.player;
+    const useAlly = snapshot.phase === "combat" && snapshot.ally !== null;
+    const nextSource: BuffSource = useAlly ? "ally" : "player";
+    const sourceBuffs = (useAlly ? snapshot.ally! : snapshot.player).buffs;
+
     const { buffSlotIds, tribeSlotIds } = this.partitionedActions();
 
-    const changedBuffs = this.slots.applyBuffs(buffSlotIds, source.buffs);
+    // When the source flips (player ↔ ally), buffs not in the new source
+    // would otherwise linger on their slots from the previous source.
+    // Reset and re-apply so the deck clearly reflects the active perspective.
+    if (this.currentSource !== nextSource) {
+      this.slots.reset();
+      this.currentSource = nextSource;
+    }
+
+    const changedBuffs = this.slots.applyBuffs(buffSlotIds, sourceBuffs);
     for (const id of changedBuffs) this.renderAction(id);
+    // Buff slots that no longer have an entry need to redraw to "blank".
+    for (const id of buffSlotIds) {
+      if (!this.slots.get(id)) this.renderAction(id);
+    }
     // Tribes always redraw — count and identity can both change.
     for (const id of tribeSlotIds) this.renderAction(id);
   }
@@ -129,9 +147,11 @@ class Grid {
       return;
     }
 
+    const phase = this.latestSnapshot?.phase;
     const { buffSlotIds, tribeSlotIds } = this.partitionedActions();
     const tribeIndex = tribeSlotIds.indexOf(actionId);
     if (tribeIndex >= 0) {
+      // Tribes are per-lobby, identical across phases — no phase bar.
       const tribe: Tribe | undefined = this.latestSnapshot?.tribes[tribeIndex];
       void placed.action.setImage(tribe ? renderTribe(tribe) : renderBlank());
       return;
@@ -139,11 +159,11 @@ class Grid {
 
     if (buffSlotIds.includes(actionId)) {
       const entry = this.slots.get(actionId);
-      void placed.action.setImage(entry ? renderBuff(entry.buff) : renderBlank());
+      void placed.action.setImage(entry ? renderBuff(entry.buff, phase) : renderBlank(phase));
       return;
     }
 
-    void placed.action.setImage(renderBlank());
+    void placed.action.setImage(renderBlank(phase));
   }
 }
 

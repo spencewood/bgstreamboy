@@ -10,8 +10,10 @@ from hslog.packets import Packet
 
 from .buff_extractor import BuffExtractor
 from .log_tailer import follow_async, replay_paced_async
+from .perspective import Perspective
 from .phase_detector import PhaseDetector
 from .snapshot import Side, Snapshot
+from .team_stats import TeamStatsTracker
 from .tribe_tracker import TribeTracker
 from .ws_server import DEFAULT_HOST, DEFAULT_PORT, SnapshotBroadcaster, serve_forever
 
@@ -23,7 +25,9 @@ class Service:
         self._broadcaster = broadcaster
         self._phase = PhaseDetector()
         self._buffs = BuffExtractor()
+        self._team_stats = TeamStatsTracker()
         self._tribes = TribeTracker()
+        self._perspective = Perspective()
         self._snapshot = Snapshot()
 
     def on_packet(self, packet: Packet) -> None:
@@ -33,10 +37,13 @@ class Service:
             self._snapshot = self._snapshot.model_copy(update={"phase": self._phase.phase})
             changed = True
 
-        if self._buffs.observe(packet):
-            self._snapshot = self._snapshot.model_copy(
-                update={"player": Side(buffs=self._buffs.buffs())}
-            )
+        # Perspective changes don't directly mutate the snapshot, but they
+        # change which controller's buffs map to player vs ally.
+        perspective_changed = self._perspective.observe(packet)
+        team_changed = self._team_stats.observe(packet)
+
+        if self._buffs.observe(packet) or perspective_changed or team_changed:
+            self._snapshot = self._snapshot.model_copy(update=self._buff_snapshot_fields())
             changed = True
 
         if self._tribes.observe(packet):
@@ -45,6 +52,28 @@ class Service:
 
         if changed:
             asyncio.create_task(self._broadcaster.broadcast(self._snapshot))
+
+    def _buff_snapshot_fields(self) -> dict[str, object]:
+        our_pid = self._perspective.our_player_id
+        ally_pid = self._perspective.ally_player_id
+
+        if our_pid is not None:
+            player_buffs = self._buffs.buffs(controller=our_pid)
+            board = self._team_stats.buff_for(our_pid)
+            if board is not None:
+                player_buffs = [board] + player_buffs
+        else:
+            player_buffs = self._buffs.buffs()
+
+        ally_side: Side | None = None
+        if ally_pid is not None:
+            ally_buffs = self._buffs.buffs(controller=ally_pid)
+            ally_board = self._team_stats.buff_for(ally_pid)
+            if ally_board is not None:
+                ally_buffs = [ally_board] + ally_buffs
+            ally_side = Side(buffs=ally_buffs)
+
+        return {"player": Side(buffs=player_buffs), "ally": ally_side}
 
 
 async def run(logs_dir: Path, host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
@@ -62,11 +91,7 @@ async def run_replay(
     port: int = DEFAULT_PORT,
     speed: float = 5.0,
 ) -> None:
-    """Drive the same WebSocket pipeline from a captured Power.log file.
-
-    The plugin sees identical traffic to a live session — useful when you
-    don't have Hearthstone running but want to demo the deck.
-    """
+    """Drive the same WebSocket pipeline from a captured Power.log file."""
     broadcaster = SnapshotBroadcaster()
     service = Service(broadcaster)
     await asyncio.gather(

@@ -8,9 +8,23 @@
 
 import { Canvas, createCanvas, type SKRSContext2D } from "@napi-rs/canvas";
 
-import type { Buff, Tribe } from "./snapshot";
+import type { Buff, Phase, Tribe } from "./snapshot";
 
 const SIZE = 144;
+
+/** Background-gradient endpoints per phase. Visible at the corners/edges of
+ * each buff tile (where the radial buff-wash is weak) without overwhelming
+ * the buff icon at the center. Tribes don't carry phase. */
+const PHASE_BG: Record<Phase, [string, string]> = {
+  recruit:     ["#1f4d7a", "#040a14"],  // cool blue
+  combat:      ["#7a2018", "#140404"],  // warm red
+  hero_select: ["#3a1d6a", "#0a0414"],
+  shopping:    ["#1f4d7a", "#040a14"],
+  other:       ["#15151a", "#050507"],
+  unknown:     ["#15151a", "#050507"],
+};
+
+const NEUTRAL_BG: [string, string] = ["#15151a", "#050507"];
 
 interface BuffIcon {
   emoji: string;
@@ -18,6 +32,7 @@ interface BuffIcon {
 }
 
 const BUFF_ICONS: Record<string, BuffIcon> = {
+  team_stats:          { emoji: "⚔️", tint: "#5cc474" },
   bloodgem:            { emoji: "💎", tint: "#b22020" },
   bloodgem_player:     { emoji: "💎", tint: "#b22020" },
 
@@ -69,6 +84,20 @@ const BUFF_ICONS: Record<string, BuffIcon> = {
   goldrinn:            { emoji: "🐺", tint: "#a06040" },
   nomi:                { emoji: "🍳", tint: "#e08040" },
 
+  // Tavern shop buffs — per-tribe icons
+  shop_buff:            { emoji: "🍺", tint: "#a07040" },
+  shop_buff_beast:      { emoji: "🐾", tint: "#90a040" },
+  shop_buff_demon:      { emoji: "👹", tint: "#7a3a3a" },
+  shop_buff_dragon:     { emoji: "🐲", tint: "#7a4ec4" },
+  shop_buff_elemental:  { emoji: "🔥", tint: "#e07020" },
+  shop_buff_mech:       { emoji: "🤖", tint: "#a0a0a8" },
+  shop_buff_multirace:  { emoji: "🌟", tint: "#d8c050" },
+  shop_buff_murloc:     { emoji: "🐟", tint: "#3060c0" },
+  shop_buff_naga:       { emoji: "🐍", tint: "#40a060" },
+  shop_buff_pirate:     { emoji: "🏴‍☠️", tint: "#5a4a30" },
+  shop_buff_quilboar:   { emoji: "🐗", tint: "#9c5a3a" },
+  shop_buff_undead:     { emoji: "💀", tint: "#7878a0" },
+
   // Spec items not yet wired (here as approximations once their extractors land)
   magnetic:            { emoji: "🧲", tint: "#a0a0a8" },
   lightfang_aura:      { emoji: "✨", tint: "#e8c948" },
@@ -102,6 +131,7 @@ const TRIBE_ICONS: Record<string, BuffIcon> = {
 const LABELS: Record<string, string> = {
   bloodgem: "Blood Gem",
   bloodgem_player: "Blood Gem",
+  team_stats: "Board Power",
   eternal_knight: "E. Knight",
   ballers_sold: "Ballers",
   pogos_played: "Pogos",
@@ -146,6 +176,18 @@ const LABELS: Record<string, string> = {
   manari_messenger: "Man'ari",
   goldrinn: "Goldrinn",
   nomi: "Nomi",
+  shop_buff: "Tavern",
+  shop_buff_beast: "Beasts",
+  shop_buff_demon: "Demons",
+  shop_buff_dragon: "Dragons",
+  shop_buff_elemental: "Elementals",
+  shop_buff_mech: "Mechs",
+  shop_buff_multirace: "Multi",
+  shop_buff_murloc: "Murlocs",
+  shop_buff_naga: "Nagas",
+  shop_buff_pirate: "Pirates",
+  shop_buff_quilboar: "Quilboars",
+  shop_buff_undead: "Undead",
   magnetic: "Magnetic",
   lightfang_aura: "Lightfang",
   spellcraft: "Spellcraft",
@@ -163,10 +205,14 @@ export async function preloadIcons(): Promise<void> {
   // no-op
 }
 
-export function renderBlank(): string {
+export function renderBlank(phase?: Phase): string {
   const canvas = createCanvas(SIZE, SIZE);
   const ctx = canvas.getContext("2d");
-  ctx.fillStyle = "#08080a";
+  const [top, bottom] = phase ? PHASE_BG[phase] : NEUTRAL_BG;
+  const grad = ctx.createLinearGradient(0, 0, 0, SIZE);
+  grad.addColorStop(0, top);
+  grad.addColorStop(1, bottom);
+  ctx.fillStyle = grad;
   ctx.fillRect(0, 0, SIZE, SIZE);
   return toDataURL(canvas);
 }
@@ -229,7 +275,8 @@ export function renderTribe(tribe: Tribe): string {
 
   // Tribe identity is in the emoji; background color encodes pool fullness
   // (green = healthy, red = nearly empty). When we don't have a fullness
-  // ratio, fall back to the tribe's identity tint.
+  // ratio, fall back to the tribe's identity tint. Tribes don't carry phase
+  // information — they're per-lobby state.
   const haveRatio = tribe.remaining != null && tribe.max && tribe.max > 0;
   const tint = haveRatio ? fullnessColor(tribe.remaining! / tribe.max!) : icon.tint;
   drawSaturatedBackground(ctx, tint);
@@ -281,26 +328,27 @@ function fullnessColor(ratio: number): string {
   return `#${r.toString(16).padStart(2, "0")}${g.toString(16).padStart(2, "0")}${b.toString(16).padStart(2, "0")}`;
 }
 
-export function renderBuff(buff: Buff): string {
+export function renderBuff(buff: Buff, phase?: Phase): string {
   const canvas = createCanvas(SIZE, SIZE);
   const ctx = canvas.getContext("2d");
   const icon = BUFF_ICONS[buff.type] ?? FALLBACK_ICON;
 
-  drawTintedBackground(ctx, icon.tint);
+  drawTintedBackground(ctx, icon.tint, phase);
   drawIconGlyph(ctx, icon.emoji);
   drawValue(ctx, displayValue(buff), { yBaseline: SIZE - 14 });
 
   return toDataURL(canvas);
 }
 
-function drawTintedBackground(ctx: SKRSContext2D, tint: string): void {
+function drawTintedBackground(ctx: SKRSContext2D, tint: string, phase?: Phase): void {
   const r = parseInt(tint.slice(1, 3), 16);
   const g = parseInt(tint.slice(3, 5), 16);
   const b = parseInt(tint.slice(5, 7), 16);
 
+  const [bgTop, bgBottom] = phase ? PHASE_BG[phase] : NEUTRAL_BG;
   const base = ctx.createLinearGradient(0, 0, 0, SIZE);
-  base.addColorStop(0, "#15151a");
-  base.addColorStop(1, "#050507");
+  base.addColorStop(0, bgTop);
+  base.addColorStop(1, bgBottom);
   ctx.fillStyle = base;
   ctx.fillRect(0, 0, SIZE, SIZE);
 

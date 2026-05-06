@@ -28,6 +28,12 @@ from watchfiles import awatch
 # arrives (or on flush) so the tags are observable.
 _DEFERRED_PACKET_TYPES = (CreateGame, FullEntity, ShowEntity, ChangeEntity)
 
+# Player declarations are nested inside a CreateGame: hslog calls
+# `register_packet` for them but their `tags` accumulate later, and the
+# whole CreateGame is what consumers actually want. Suppress them from the
+# user callback and keep the pending CreateGame alive across them.
+_NESTED_IN_CREATE_GAME = (CreateGame.Player,)
+
 DEFAULT_LOGS_DIR = Path("/Applications/Hearthstone/Logs")
 
 PacketCallback = Callable[[Packet], None]
@@ -66,6 +72,10 @@ def _hook_register_packet(parser: LogParser, on_packet: PacketCallback) -> tuple
 
     def hooked(packet: Packet, node=None) -> None:
         original(packet, node)
+        # Player declarations belong to the in-flight CreateGame — keep the
+        # pending CreateGame alive so it can keep accumulating Players + tags.
+        if isinstance(packet, _NESTED_IN_CREATE_GAME):
+            return
         if pending[0] is not None:
             on_packet(pending[0])
             pending[0] = None
@@ -124,11 +134,15 @@ async def follow_async(logs_dir: Path, on_packet: PacketCallback) -> None:
 
 
 async def _consume_session(log_path: Path, parser: LogParser, logs_dir: Path) -> None:
-    """Tail log_path. Return when a newer session appears or the file is truncated."""
+    """Tail log_path. Return when a newer session appears or the file is truncated.
+
+    Reads from the beginning of the file so we don't miss CREATE_GAME (which
+    typically lands moments before we attach to a freshly-created session log).
+    """
     with log_path.open("r", encoding="utf-8", errors="replace") as f:
-        f.seek(0, 2)
-        last_size = f.tell()
+        f.seek(0)
         _drain_complete_lines(f, parser)
+        last_size = log_path.stat().st_size
         async for _ in awatch(str(logs_dir), recursive=True, debounce=200):
             latest = find_latest_session_log(logs_dir)
             if latest is not None and latest != log_path:
@@ -200,7 +214,7 @@ async def replay_paced_async(
     on_packet: PacketCallback,
     *,
     speed: float = 5.0,
-    max_gap_seconds: float = 1.0,
+    max_gap_seconds: float = 5.0,
 ) -> None:
     """Replay a captured Power.log over time, pacing by its embedded timestamps.
 

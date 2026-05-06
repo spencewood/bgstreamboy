@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 from hearthstone.enums import GameTag
-from hslog.packets import FullEntity, Packet, TagChange
+from hslog.packets import FullEntity, Packet, ShowEntity, TagChange
 
 from .snapshot import Buff
 
@@ -125,6 +125,20 @@ _REGISTRY: tuple[BuffSpec, ...] = (
     _S("BGS_018pe",         "goldrinn"),
     _S("BGS_104pe",         "nomi"),
 
+    # ---- Tavern shop buffs (BG_ShopBuff_*); per-tribe + generic ----
+    _S("BG_ShopBuff",          "shop_buff"),
+    _S("BG_ShopBuff_Beast",    "shop_buff_beast"),
+    _S("BG_ShopBuff_Demon",    "shop_buff_demon"),
+    _S("BG_ShopBuff_Dragon",   "shop_buff_dragon"),
+    _S("BG_ShopBuff_Elemental", "shop_buff_elemental"),
+    _S("BG_ShopBuff_Mech",     "shop_buff_mech"),
+    _S("BG_ShopBuff_MultiRace", "shop_buff_multirace"),
+    _S("BG_ShopBuff_Murloc",   "shop_buff_murloc"),
+    _S("BG_ShopBuff_Naga",     "shop_buff_naga"),
+    _S("BG_ShopBuff_Pirate",   "shop_buff_pirate"),
+    _S("BG_ShopBuff_Quilboar", "shop_buff_quilboar"),
+    _S("BG_ShopBuff_Undead",   "shop_buff_undead"),
+
     # ---- Self-tracking minions: read values off ATK/HEALTH on the minion ----
     BuffSpec(
         card_ids=frozenset({"BG26_766", "BG26_766_G"}),
@@ -173,58 +187,82 @@ def _read_nums(tags: list[tuple[int, int]], value_tags: tuple[int, int | None]) 
     return num1, num2
 
 
+def _read_controller(tags: list[tuple[int, int]]) -> int | None:
+    for tag, val in tags:
+        if tag == GameTag.CONTROLLER:
+            return val
+    return None
+
+
+# Sentinel for "controller wasn't on the entity's tags" — collapses to a
+# pseudo-shared bucket so legacy callers (or solo games where we don't care
+# about controller) still see all tracked buffs.
+_UNKNOWN_CONTROLLER = 0
+
+
 class BuffExtractor:
     def __init__(self) -> None:
-        self._buffs: dict[str, Buff] = {}
-        # For player-tracker entities we track entity_id → buff_type so
-        # subsequent TagChanges that mutate NUM_1/NUM_2 can route to the
-        # right buff slot.
-        self._tracked_entities: dict[int, BuffSpec] = {}
+        # controller (player_id) -> buff_type -> Buff
+        self._buffs: dict[int, dict[str, Buff]] = {}
+        # For player-tracker entities, store (spec, controller) so subsequent
+        # TagChanges that mutate values route to the right per-controller bucket.
+        self._tracked_entities: dict[int, tuple[BuffSpec, int]] = {}
 
     def observe(self, packet: Packet) -> bool:
-        if isinstance(packet, FullEntity):
-            return self._observe_full_entity(packet)
+        if isinstance(packet, (FullEntity, ShowEntity)):
+            return self._observe_entity(packet)
         if isinstance(packet, TagChange):
             return self._observe_tag_change(packet)
         return False
 
-    def _observe_full_entity(self, packet: FullEntity) -> bool:
+    def _observe_entity(self, packet: FullEntity | ShowEntity) -> bool:
+        """Handle both FULL_ENTITY (entity created visibly) and SHOW_ENTITY
+        (entity revealed after being created hidden). Both carry a card_id
+        and tags accumulated from the log."""
         spec = _BY_CARD_ID.get(packet.card_id or "")
         if spec is None:
             return False
 
         num1, num2 = _read_nums(packet.tags, spec.value_tags)
+        controller = _read_controller(packet.tags) or _UNKNOWN_CONTROLLER
 
         if spec.kind == "player_tracker":
             eid = _entity_id(packet.entity)
             if eid is not None:
-                self._tracked_entities[eid] = spec
+                self._tracked_entities[eid] = (spec, controller)
 
-        return self._update_buff(spec, num1, num2)
+        return self._update_buff(spec, controller, num1, num2)
 
     def _observe_tag_change(self, packet: TagChange) -> bool:
         eid = _entity_id(packet.entity)
         if eid is None:
             return False
-        spec = self._tracked_entities.get(eid)
-        if spec is None or spec.kind != "player_tracker":
+        tracked = self._tracked_entities.get(eid)
+        if tracked is None:
+            return False
+        spec, controller = tracked
+        if spec.kind != "player_tracker":
             return False
 
         num1_tag, num2_tag = spec.value_tags
         if packet.tag == num1_tag:
-            return self._update_field(spec, num1=packet.value)
+            return self._update_field(spec, controller, num1=packet.value)
         if num2_tag is not None and packet.tag == num2_tag:
-            return self._update_field(spec, num2=packet.value)
+            return self._update_field(spec, controller, num2=packet.value)
         return False
 
-    def _update_buff(self, spec: BuffSpec, num1: int | None, num2: int | None) -> bool:
-        existing = self._buffs.get(spec.buff_type)
+    def _bucket(self, controller: int) -> dict[str, Buff]:
+        return self._buffs.setdefault(controller, {})
+
+    def _update_buff(self, spec: BuffSpec, controller: int, num1: int | None, num2: int | None) -> bool:
+        bucket = self._bucket(controller)
+        existing = bucket.get(spec.buff_type)
         if spec.field == "attack_health":
             if num1 is None or num2 is None:
                 return False
             if existing and existing.attack == num1 and existing.health == num2:
                 return False
-            self._buffs[spec.buff_type] = Buff(
+            bucket[spec.buff_type] = Buff(
                 type=spec.buff_type,
                 attack=num1,
                 health=num2,
@@ -236,24 +274,43 @@ class BuffExtractor:
             return False
         if existing and existing.value == num1:
             return False
-        self._buffs[spec.buff_type] = Buff(
+        bucket[spec.buff_type] = Buff(
             type=spec.buff_type,
             value=num1,
             last_changed=time.time(),
         )
         return True
 
-    def _update_field(self, spec: BuffSpec, *, num1: int | None = None, num2: int | None = None) -> bool:
-        existing = self._buffs.get(spec.buff_type)
+    def _update_field(self, spec: BuffSpec, controller: int, *, num1: int | None = None, num2: int | None = None) -> bool:
+        bucket = self._bucket(controller)
+        existing = bucket.get(spec.buff_type)
         if existing is None:
-            # No baseline yet; can't update a field without the other.
+            # Many BG player trackers (e.g. BG25_008pe) arrive without initial
+            # NUM tags and only get them populated via subsequent TagChanges.
+            # Initialize the buff on first TagChange so we don't drop it.
+            if spec.field == "value" and num1 is not None:
+                bucket[spec.buff_type] = Buff(
+                    type=spec.buff_type,
+                    value=num1,
+                    last_changed=time.time(),
+                )
+                return True
+            if spec.field == "attack_health" and num1 is not None and num2 is not None:
+                bucket[spec.buff_type] = Buff(
+                    type=spec.buff_type,
+                    attack=num1,
+                    health=num2,
+                    last_changed=time.time(),
+                )
+                return True
+            # Stat-pair with only one of the two values yet — wait for the other.
             return False
         if spec.field == "attack_health":
             new_attack = num1 if num1 is not None else existing.attack
             new_health = num2 if num2 is not None else existing.health
             if new_attack == existing.attack and new_health == existing.health:
                 return False
-            self._buffs[spec.buff_type] = existing.model_copy(update={
+            bucket[spec.buff_type] = existing.model_copy(update={
                 "attack": new_attack,
                 "health": new_health,
                 "last_changed": time.time(),
@@ -263,11 +320,22 @@ class BuffExtractor:
         new_val = num1 if num1 is not None else existing.value
         if new_val == existing.value:
             return False
-        self._buffs[spec.buff_type] = existing.model_copy(update={
+        bucket[spec.buff_type] = existing.model_copy(update={
             "value": new_val,
             "last_changed": time.time(),
         })
         return True
 
-    def buffs(self) -> list[Buff]:
-        return list(self._buffs.values())
+    def buffs(self, controller: int | None = None) -> list[Buff]:
+        """Return tracked buffs.
+
+        With `controller` set, returns only that player's buffs. Without it,
+        returns the union across all controllers seen — useful when we
+        haven't yet identified perspective.
+        """
+        if controller is not None:
+            return list(self._buffs.get(controller, {}).values())
+        out: list[Buff] = []
+        for bucket in self._buffs.values():
+            out.extend(bucket.values())
+        return out

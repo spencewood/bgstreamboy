@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# bgstreamboy — top-level launcher for the companion service and demos.
+#
+# Usage:
+#   ./bgstreamboy              run the live companion (tails Hearthstone)
+#   ./bgstreamboy demo         animate the test storyboard on your deck
+#   ./bgstreamboy test         run the simulator scenarios (no deck needed)
+#   ./bgstreamboy install      install Hearthstone's log.config (one-time)
+#   ./bgstreamboy plugin       quick plugin actions (build / link / restart)
+#   ./bgstreamboy <args…>      pass through to `uv run bgstreamboy <args>`
+#                              (e.g. `--replay path/to/Power.log`)
+#
+# Symlink into your PATH for a global command:
+#   ln -s "$(pwd)/bgstreamboy" /usr/local/bin/bgstreamboy
+#
+set -euo pipefail
+
+# Resolve symlinks so the launcher works when called via /usr/local/bin etc.
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+  TARGET="$(readlink "$SOURCE")"
+  if [[ "$TARGET" = /* ]]; then
+    SOURCE="$TARGET"
+  else
+    SOURCE="$(cd -P "$(dirname "$SOURCE")" && pwd)/$TARGET"
+  fi
+done
+ROOT="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+COMPANION="$ROOT/companion"
+PLUGIN="$ROOT/plugin"
+
+cd "$COMPANION"
+
+cmd="${1:-live}"
+case "$cmd" in
+  live|"")
+    exec uv run bgstreamboy
+    ;;
+  demo)
+    shift || true
+    exec uv run python tests/demo_on_deck.py "$@"
+    ;;
+  test|tests)
+    exec uv run python tests/scenarios.py
+    ;;
+  install)
+    exec uv run bgstreamboy --install-log-config
+    ;;
+  plugin)
+    shift || true
+    sub="${1:-help}"
+    cd "$PLUGIN"
+    case "$sub" in
+      build)   exec npm run build ;;
+      link)    exec npm run link ;;
+      restart)
+        # Force-kill the plugin process so Stream Deck respawns with the
+        # latest bundle (workaround for a race in `streamdeck restart`).
+        npm run build
+        sync
+        sleep 1
+        pid=$(pgrep -f "com.bgstreamboy.companion.sdPlugin/bin/plugin.js" | head -1 || true)
+        if [[ -n "$pid" ]]; then
+          echo "killing plugin PID $pid"
+          kill "$pid" || true
+          sleep 2
+        fi
+        npx --yes streamdeck restart com.bgstreamboy.companion
+        ;;
+      *)
+        echo "plugin subcommands: build | link | restart" >&2
+        exit 2
+        ;;
+    esac
+    ;;
+  -h|--help|help)
+    sed -n '2,15p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'
+    ;;
+  *)
+    # Pass through to the companion CLI for things like --replay, --help, etc.
+    exec uv run bgstreamboy "$@"
+    ;;
+esac
