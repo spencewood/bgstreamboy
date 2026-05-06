@@ -155,6 +155,8 @@ async def _consume_session(log_path: Path, parser: LogParser, logs_dir: Path) ->
         f.seek(0)
         _drain_complete_lines(f, parser, rotator)
         last_size = log_path.stat().st_size
+        if rotator.maybe_rotate():
+            return  # attached to an already-oversized file
         async for _ in awatch(str(logs_dir), recursive=True, debounce=200):
             latest = find_latest_session_log(logs_dir)
             if latest is not None and latest != log_path:

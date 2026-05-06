@@ -138,6 +138,12 @@ async def _consume_console_session(
         f.seek(0)
         _drain_console_lines(f, parser, rotator)
         last_size = log_path.stat().st_size
+        # If we attached to a file that's already past the rotate threshold
+        # (e.g. a long session that ran while the companion was off), rotate
+        # immediately. awatch only fires on subsequent writes — without this
+        # check, a stale 10 MB file just sits there forever.
+        if rotator.maybe_rotate():
+            return
         async for _ in awatch(str(logs_dir), recursive=True, debounce=200):
             latest = find_latest_hearthstone_log(logs_dir)
             if latest is not None and latest != log_path:
